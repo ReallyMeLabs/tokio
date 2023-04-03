@@ -2,15 +2,21 @@
 
 members = [
   "tokio",
-  "tokio-macros",
+  "tokio-buf",
+  "tokio-codec",
+  "tokio-current-thread",
+  "tokio-executor",
+  "tokio-fs",
+  "tokio-futures",
+  "tokio-io",
+  "tokio-reactor",
+  "tokio-signal",
+  "tokio-sync",
   "tokio-test",
-  "tokio-stream",
-  "tokio-util",
-
-  # Internal
-  "benches",
-  "examples",
-  "stress-test",
-  "tests-build",
-  "tests-integration",
+  "tokio-threadpool",
+  "tokio-timer",
+  "tokio-tcp",
+  "tokio-tls",
+  "tokio-udp",
+  "tokio-uds",
 ]

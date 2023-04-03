@@ -1,282 +1,133 @@
-//! Futures task based helpers to easily test futures and manually written futures.
-//!
-//! The [`Spawn`] type is used as a mock task harness that allows you to poll futures
-//! without needing to setup pinning or context. Any future can be polled but if the
-//! future requires the tokio async context you will need to ensure that you poll the
-//! [`Spawn`] within a tokio context, this means that as long as you are inside the
-//! runtime it will work and you can poll it via [`Spawn`].
-//!
-//! [`Spawn`] also supports [`Stream`] to call `poll_next` without pinning
-//! or context.
-//!
-//! In addition to circumventing the need for pinning and context, [`Spawn`] also tracks
-//! the amount of times the future/task was woken. This can be useful to track if some
-//! leaf future notified the root task correctly.
+//! Futures task based helpers
 //!
 //! # Example
 //!
+//! This example will use the `MockTask` to set the current task on
+//! poll.
+//!
 //! ```
-//! use tokio_test::task;
+//! # #[macro_use] extern crate tokio_test;
+//! # extern crate futures;
+//! # use tokio_test::task::MockTask;
+//! # use futures::{sync::mpsc, Stream, Sink, Future, Async};
+//! let mut task = MockTask::new();
+//! let (tx, mut rx) = mpsc::channel(5);
 //!
-//! let fut = async {};
+//! tx.send(()).wait();
 //!
-//! let mut task = task::spawn(fut);
-//!
-//! assert!(task.poll().is_ready(), "Task was not ready!");
+//! assert_ready_eq!(task.enter(|| rx.poll()), Some(()));
 //! ```
 
-#![allow(clippy::mutex_atomic)]
+use futures::executor::{spawn, Notify};
+use futures::{future, Async};
 
-use std::future::Future;
-use std::mem;
-use std::ops;
-use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use tokio_stream::Stream;
-
-/// Spawn a future into a [`Spawn`] which wraps the future in a mocked executor.
+/// Mock task
 ///
-/// This can be used to spawn a [`Future`] or a [`Stream`].
-///
-/// For more information, check the module docs.
-pub fn spawn<T>(task: T) -> Spawn<T> {
-    Spawn {
-        task: MockTask::new(),
-        future: Box::pin(task),
-    }
-}
-
-/// Future spawned on a mock task that can be used to poll the future or stream
-/// without needing pinning or context types.
+/// A mock task is able to intercept and track notifications.
 #[derive(Debug)]
-pub struct Spawn<T> {
-    task: MockTask,
-    future: Pin<Box<T>>,
-}
-
-#[derive(Debug, Clone)]
-struct MockTask {
-    waker: Arc<ThreadWaker>,
+pub struct MockTask {
+    notify: Arc<ThreadNotify>,
 }
 
 #[derive(Debug)]
-struct ThreadWaker {
-    state: Mutex<usize>,
+struct ThreadNotify {
+    state: AtomicUsize,
+    mutex: Mutex<()>,
     condvar: Condvar,
 }
 
 const IDLE: usize = 0;
-const WAKE: usize = 1;
+const NOTIFY: usize = 1;
 const SLEEP: usize = 2;
 
-impl<T> Spawn<T> {
-    /// Consumes `self` returning the inner value
-    pub fn into_inner(self) -> T
-    where
-        T: Unpin,
-    {
-        *Pin::into_inner(self.future)
+impl MockTask {
+    /// Create a new mock task
+    pub fn new() -> Self {
+        MockTask {
+            notify: Arc::new(ThreadNotify::new()),
+        }
     }
 
-    /// Returns `true` if the inner future has received a wake notification
-    /// since the last call to `enter`.
-    pub fn is_woken(&self) -> bool {
-        self.task.is_woken()
-    }
-
-    /// Returns the number of references to the task waker
+    /// Run a closure from the context of the task.
     ///
-    /// The task itself holds a reference. The return value will never be zero.
-    pub fn waker_ref_count(&self) -> usize {
-        self.task.waker_ref_count()
-    }
-
-    /// Enter the task context
+    /// Any notifications resulting from the execution of the closure are
+    /// tracked.
     pub fn enter<F, R>(&mut self, f: F) -> R
     where
-        F: FnOnce(&mut Context<'_>, Pin<&mut T>) -> R,
+        F: FnOnce() -> R,
     {
-        let fut = self.future.as_mut();
-        self.task.enter(|cx| f(cx, fut))
-    }
-}
+        self.notify.clear();
 
-impl<T: Unpin> ops::Deref for Spawn<T> {
-    type Target = T;
+        let res = spawn(future::lazy(|| Ok::<_, ()>(f()))).poll_future_notify(&self.notify, 0);
 
-    fn deref(&self) -> &T {
-        &self.future
-    }
-}
-
-impl<T: Unpin> ops::DerefMut for Spawn<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.future
-    }
-}
-
-impl<T: Future> Spawn<T> {
-    /// If `T` is a [`Future`] then poll it. This will handle pinning and the context
-    /// type for the future.
-    pub fn poll(&mut self) -> Poll<T::Output> {
-        let fut = self.future.as_mut();
-        self.task.enter(|cx| fut.poll(cx))
-    }
-}
-
-impl<T: Stream> Spawn<T> {
-    /// If `T` is a [`Stream`] then poll_next it. This will handle pinning and the context
-    /// type for the stream.
-    pub fn poll_next(&mut self) -> Poll<Option<T::Item>> {
-        let stream = self.future.as_mut();
-        self.task.enter(|cx| stream.poll_next(cx))
-    }
-}
-
-impl<T: Future> Future for Spawn<T> {
-    type Output = T::Output;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.future.as_mut().poll(cx)
-    }
-}
-
-impl<T: Stream> Stream for Spawn<T> {
-    type Item = T::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.future.as_mut().poll_next(cx)
-    }
-}
-
-impl MockTask {
-    /// Creates new mock task
-    fn new() -> Self {
-        MockTask {
-            waker: Arc::new(ThreadWaker::new()),
-        }
-    }
-
-    /// Runs a closure from the context of the task.
-    ///
-    /// Any wake notifications resulting from the execution of the closure are
-    /// tracked.
-    fn enter<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut Context<'_>) -> R,
-    {
-        self.waker.clear();
-        let waker = self.waker();
-        let mut cx = Context::from_waker(&waker);
-
-        f(&mut cx)
-    }
-
-    /// Returns `true` if the inner future has received a wake notification
-    /// since the last call to `enter`.
-    fn is_woken(&self) -> bool {
-        self.waker.is_woken()
-    }
-
-    /// Returns the number of references to the task waker
-    ///
-    /// The task itself holds a reference. The return value will never be zero.
-    fn waker_ref_count(&self) -> usize {
-        Arc::strong_count(&self.waker)
-    }
-
-    fn waker(&self) -> Waker {
-        unsafe {
-            let raw = to_raw(self.waker.clone());
-            Waker::from_raw(raw)
-        }
-    }
-}
-
-impl Default for MockTask {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ThreadWaker {
-    fn new() -> Self {
-        ThreadWaker {
-            state: Mutex::new(IDLE),
-            condvar: Condvar::new(),
-        }
-    }
-
-    /// Clears any previously received wakes, avoiding potential spurious
-    /// wake notifications. This should only be called immediately before running the
-    /// task.
-    fn clear(&self) {
-        *self.state.lock().unwrap() = IDLE;
-    }
-
-    fn is_woken(&self) -> bool {
-        match *self.state.lock().unwrap() {
-            IDLE => false,
-            WAKE => true,
+        match res.unwrap() {
+            Async::Ready(v) => v,
             _ => unreachable!(),
         }
     }
 
-    fn wake(&self) {
-        // First, try transitioning from IDLE -> NOTIFY, this does not require a lock.
-        let mut state = self.state.lock().unwrap();
-        let prev = *state;
+    /// Returns `true` if the inner future has received a readiness notification
+    /// since the last call to `enter`.
+    pub fn is_notified(&self) -> bool {
+        self.notify.is_notified()
+    }
 
-        if prev == WAKE {
-            return;
-        }
-
-        *state = WAKE;
-
-        if prev == IDLE {
-            return;
-        }
-
-        // The other half is sleeping, so we wake it up.
-        assert_eq!(prev, SLEEP);
-        self.condvar.notify_one();
+    /// Returns the number of references to the task notifier
+    ///
+    /// The task itself holds a reference. The return value will never be zero.
+    pub fn notifier_ref_count(&self) -> usize {
+        Arc::strong_count(&self.notify)
     }
 }
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
+impl ThreadNotify {
+    fn new() -> Self {
+        ThreadNotify {
+            state: AtomicUsize::new(IDLE),
+            mutex: Mutex::new(()),
+            condvar: Condvar::new(),
+        }
+    }
 
-unsafe fn to_raw(waker: Arc<ThreadWaker>) -> RawWaker {
-    RawWaker::new(Arc::into_raw(waker) as *const (), &VTABLE)
+    /// Clears any previously received notify, avoiding potential spurrious
+    /// notifications. This should only be called immediately before running the
+    /// task.
+    fn clear(&self) {
+        self.state.store(IDLE, Ordering::SeqCst);
+    }
+
+    fn is_notified(&self) -> bool {
+        match self.state.load(Ordering::SeqCst) {
+            IDLE => false,
+            NOTIFY => true,
+            _ => unreachable!(),
+        }
+    }
 }
 
-unsafe fn from_raw(raw: *const ()) -> Arc<ThreadWaker> {
-    Arc::from_raw(raw as *const ThreadWaker)
-}
+impl Notify for ThreadNotify {
+    fn notify(&self, _unpark_id: usize) {
+        // First, try transitioning from IDLE -> NOTIFY, this does not require a
+        // lock.
+        match self.state.compare_and_swap(IDLE, NOTIFY, Ordering::SeqCst) {
+            IDLE | NOTIFY => return,
+            SLEEP => {}
+            _ => unreachable!(),
+        }
 
-unsafe fn clone(raw: *const ()) -> RawWaker {
-    let waker = from_raw(raw);
+        // The other half is sleeping, this requires a lock
+        let _m = self.mutex.lock().unwrap();
 
-    // Increment the ref count
-    mem::forget(waker.clone());
+        // Transition from SLEEP -> NOTIFY
+        match self.state.compare_and_swap(SLEEP, NOTIFY, Ordering::SeqCst) {
+            SLEEP => {}
+            _ => return,
+        }
 
-    to_raw(waker)
-}
-
-unsafe fn wake(raw: *const ()) {
-    let waker = from_raw(raw);
-    waker.wake();
-}
-
-unsafe fn wake_by_ref(raw: *const ()) {
-    let waker = from_raw(raw);
-    waker.wake();
-
-    // We don't actually own a reference to the unparker
-    mem::forget(waker);
-}
-
-unsafe fn drop_waker(raw: *const ()) {
-    let _ = from_raw(raw);
+        // Wakeup the sleeper
+        self.condvar.notify_one();
+    }
 }
